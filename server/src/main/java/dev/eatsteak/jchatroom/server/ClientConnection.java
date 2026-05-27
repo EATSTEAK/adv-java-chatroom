@@ -41,7 +41,7 @@ final class ClientConnection implements ClientConnectionContext {
 
     private SelectionKey key;
     private long lastActivityNanos = System.nanoTime();
-    private boolean closed;
+    private volatile boolean closed;
     private boolean closeAfterWrites;
     private boolean commandRunning;
 
@@ -213,7 +213,11 @@ final class ClientConnection implements ClientConnectionContext {
         outbound.clear();
         closeChannel();
         reactor.remove(this);
-        server.releaseClient();
+        try {
+            server.clientClosed(this);
+        } finally {
+            server.releaseClient();
+        }
     }
 
     @Override
@@ -234,6 +238,11 @@ final class ClientConnection implements ClientConnectionContext {
     @Override
     public void closeNow() {
         reactor.closeNow(this);
+    }
+
+    @Override
+    public boolean isOpen() {
+        return !closed;
     }
 
     private void dispatchLine(String line) {

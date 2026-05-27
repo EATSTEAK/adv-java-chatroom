@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -22,14 +23,122 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class NioChatServerIntegrationTest {
     @Test
     @Timeout(5)
-    void acceptsReadsAndWritesPlaceholderProtocolResponsesForMultipleClients() throws Exception {
+    void loginSuccessReturnsUsername() throws Exception {
         NioChatServer server = new NioChatServer(testConfig());
         try {
             server.start();
 
-            assertPlaceholderResponse(server.port(), "LOGIN alpha", "OK LOGIN");
-            assertPlaceholderResponse(server.port(), "LIST USERS", "OK LIST USERS");
+            try (Socket socket = connect(server.port())) {
+                writeLine(socket, "LOGIN alpha");
+
+                assertEquals("OK LOGIN alpha", reader(socket).readLine());
+                assertEquals(1, server.activeSessionCount());
+            }
         } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void duplicateUsernameIsRejectedUnderSeparateConnections() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket first = connect(server.port()); Socket second = connect(server.port())) {
+                BufferedReader firstReader = reader(first);
+                BufferedReader secondReader = reader(second);
+
+                writeLine(first, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", firstReader.readLine());
+
+                writeLine(second, "LOGIN alpha");
+                assertEquals("ERR 409 :duplicate username", secondReader.readLine());
+                assertEquals(1, server.activeSessionCount());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void loginBeforeCommandIsEnforcedWithoutClosingConnection() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket socket = connect(server.port())) {
+                BufferedReader reader = reader(socket);
+
+                writeLine(socket, "LIST USERS");
+                assertEquals("ERR 401 :login required", reader.readLine());
+
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void quitRemovesSessionAndClosesConnectionAfterResponse() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket socket = connect(server.port())) {
+                BufferedReader reader = reader(socket);
+
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
+
+                writeLine(socket, "QUIT");
+                assertEquals("OK QUIT", reader.readLine());
+                assertNull(reader.readLine());
+            }
+
+            try (Socket socket = connect(server.port())) {
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader(socket).readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void remoteSocketCloseRemovesSessionSoUsernameCanBeReused() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        Socket socket = null;
+        try {
+            server.start();
+            socket = connect(server.port());
+            BufferedReader reader = reader(socket);
+
+            writeLine(socket, "LOGIN alpha");
+            assertEquals("OK LOGIN alpha", reader.readLine());
+            socket.close();
+            socket = null;
+
+            waitUntil(() -> server.activeSessionCount() == 0);
+
+            try (Socket next = connect(server.port())) {
+                writeLine(next, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader(next).readLine());
+            }
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
             server.shutdown();
             assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
         }
@@ -46,8 +155,8 @@ class NioChatServerIntegrationTest {
                 BufferedReader reader = reader(socket);
                 writeRaw(socket, "LOGIN alpha\nLIST USERS\n");
 
-                assertEquals("OK LOGIN", reader.readLine());
-                assertEquals("OK LIST USERS", reader.readLine());
+                assertEquals("OK LOGIN alpha", reader.readLine());
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
             }
         } finally {
             server.shutdown();
@@ -67,7 +176,7 @@ class NioChatServerIntegrationTest {
                 Thread.sleep(50);
                 writeRaw(socket, "IN alpha\n");
 
-                assertEquals("OK LOGIN", reader(socket).readLine());
+                assertEquals("OK LOGIN alpha", reader(socket).readLine());
             }
         } finally {
             server.shutdown();
@@ -84,9 +193,11 @@ class NioChatServerIntegrationTest {
 
             try (Socket socket = connect(server.port())) {
                 BufferedReader reader = reader(socket);
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
                 writeLine(socket, "MSG lobby :" + "\uD55C".repeat(ProtocolValidator.MAX_MESSAGE_BODY_LENGTH));
 
-                assertEquals("OK MSG", reader.readLine());
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
             }
         } finally {
             server.shutdown();
@@ -123,6 +234,8 @@ class NioChatServerIntegrationTest {
 
             try (Socket socket = connect(server.port())) {
                 BufferedReader reader = reader(socket);
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
                 writeLine(socket, "MSG lobby :" + "A".repeat(513));
 
                 assertEquals("ERR 413 :line or message too long", reader.readLine());
@@ -200,15 +313,59 @@ class NioChatServerIntegrationTest {
 
     @Test
     @Timeout(5)
-    void idleTimeoutClosesInactiveConnection() throws Exception {
+    void idleTimeoutClosesInactiveConnectionAndRemovesSession() throws Exception {
         NioChatServer server = new NioChatServer(new ServerConfig(0, 1, 1, 16, 8, 1));
         try {
             server.start();
 
             try (Socket socket = connect(server.port())) {
+                BufferedReader reader = reader(socket);
+                writeLine(socket, "LOGIN idle_user");
+                assertEquals("OK LOGIN idle_user", reader.readLine());
+
                 socket.setSoTimeout(4_000);
-                assertEquals(-1, socket.getInputStream().read());
+                assertNull(reader.readLine());
                 assertEquals(0, server.clientCount());
+                assertEquals(0, server.activeSessionCount());
+            }
+
+            try (Socket socket = connect(server.port())) {
+                writeLine(socket, "LOGIN idle_user");
+                assertEquals("OK LOGIN idle_user", reader(socket).readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void placeholderCommandsAfterLoginReturnNotImplementedWithoutClosing() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket socket = connect(server.port())) {
+                BufferedReader reader = reader(socket);
+
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
+
+                writeLine(socket, "ROOM CREATE lobby");
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+
+                writeLine(socket, "MSG lobby :hello");
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+
+                writeLine(socket, "WHISPER beta :private");
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+
+                writeLine(socket, "LIST USERS");
+                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+
+                writeLine(socket, "QUIT");
+                assertEquals("OK QUIT", reader.readLine());
             }
         } finally {
             server.shutdown();
@@ -255,13 +412,15 @@ class NioChatServerIntegrationTest {
             BufferedReader reader = reader(socket);
 
             writeLine(socket, "LOGIN before_shutdown");
-            assertEquals("OK LOGIN", reader.readLine());
+            assertEquals("OK LOGIN before_shutdown", reader.readLine());
             assertTrue(server.isRunning());
+            assertEquals(1, server.activeSessionCount());
 
             server.shutdown();
             assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
             assertFalse(server.isRunning());
             assertEquals(0, server.clientCount());
+            assertEquals(0, server.activeSessionCount());
             assertNull(reader.readLine());
         } finally {
             if (socket != null) {
@@ -282,15 +441,17 @@ class NioChatServerIntegrationTest {
             BufferedReader reader = reader(socket);
 
             writeLine(socket, "LOGIN before_failure");
-            assertEquals("OK LOGIN", reader.readLine());
+            assertEquals("OK LOGIN before_failure", reader.readLine());
             assertTrue(server.isRunning());
             assertEquals(1, server.clientCount());
+            assertEquals(1, server.activeSessionCount());
 
             server.reactorFailed(new IOException("selector failure"));
 
             assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
             assertFalse(server.isRunning());
             assertEquals(0, server.clientCount());
+            assertEquals(0, server.activeSessionCount());
             assertNull(reader.readLine());
         } finally {
             if (socket != null) {
@@ -304,19 +465,23 @@ class NioChatServerIntegrationTest {
         return new ServerConfig(0, 2, 2, 16, 8, 600);
     }
 
-    private static void assertPlaceholderResponse(int port, String line, String expected) throws IOException {
-        try (Socket socket = connect(port)) {
-            writeLine(socket, line);
-            assertEquals(expected, reader(socket).readLine());
-        }
-    }
-
     private static Socket connect(int port) throws IOException {
         Socket socket = new Socket();
         socket.connect(new InetSocketAddress("127.0.0.1", port), 1_000);
         socket.setSoTimeout(2_000);
         socket.setTcpNoDelay(true);
         return socket;
+    }
+
+    private static void waitUntil(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        assertTrue(condition.getAsBoolean());
     }
 
     private static void writeLine(Socket socket, String line) throws IOException {

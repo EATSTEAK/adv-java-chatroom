@@ -10,4 +10,8 @@ interface ClientConnectionContext {
     void closeWithError(ProtocolErrorCode errorCode, String message);
 
     void closeNow();
+
+    default boolean isOpen() {
+        return true;
+    }
 }

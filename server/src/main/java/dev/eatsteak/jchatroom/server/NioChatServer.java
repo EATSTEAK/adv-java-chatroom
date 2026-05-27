@@ -22,7 +22,7 @@ public final class NioChatServer implements AutoCloseable {
     private ServerSocketChannel serverChannel;
 
     public NioChatServer(ServerConfig config) {
-        this(config, PlaceholderCommandHandler.INSTANCE);
+        this(config, new SessionCommandHandler());
     }
 
     NioChatServer(ServerConfig config, ClientCommandHandler commandHandler) {
@@ -64,6 +64,8 @@ public final class NioChatServer implements AutoCloseable {
         if (!running.compareAndSet(true, false)) {
             return;
         }
+
+        shutdownCommandHandler();
 
         if (boss != null) {
             boss.shutdown();
@@ -144,6 +146,14 @@ public final class NioChatServer implements AutoCloseable {
         commandHandler.handle(connection, line);
     }
 
+    void clientClosed(ClientConnectionContext connection) {
+        try {
+            commandHandler.onConnectionClosed(connection);
+        } catch (RuntimeException ignored) {
+            // Client slot release and channel cleanup must continue even if cleanup hooks fail.
+        }
+    }
+
     boolean isRunning() {
         return running.get();
     }
@@ -155,6 +165,13 @@ public final class NioChatServer implements AutoCloseable {
 
     int clientCount() {
         return clientCount.get();
+    }
+
+    int activeSessionCount() {
+        if (commandHandler instanceof SessionCommandHandler sessionCommandHandler) {
+            return sessionCommandHandler.activeSessionCount();
+        }
+        return 0;
     }
 
     private WorkerReactor[] createWorkers() throws IOException {
@@ -186,6 +203,14 @@ public final class NioChatServer implements AutoCloseable {
             serverChannel.close();
         } catch (IOException ignored) {
             // Shutdown remains best-effort if the accept channel is already closed.
+        }
+    }
+
+    private void shutdownCommandHandler() {
+        try {
+            commandHandler.shutdown();
+        } catch (RuntimeException ignored) {
+            // Server shutdown continues even if command-layer cleanup is already complete.
         }
     }
 
