@@ -34,6 +34,7 @@ final class ClientConnection implements ClientConnectionContext {
     private final SocketChannel channel;
     private final int inboundQueueCapacity;
     private final int outboundQueueCapacity;
+    private final String remoteAddress;
     private final ByteBuffer readBuffer = ByteBuffer.allocate(READ_BUFFER_BYTES);
     private final ByteArrayOutputStream lineBuffer = new ByteArrayOutputStream();
     private final Queue<String> inboundLines = new ArrayDeque<>();
@@ -44,6 +45,7 @@ final class ClientConnection implements ClientConnectionContext {
     private volatile boolean closed;
     private boolean closeAfterWrites;
     private boolean commandRunning;
+    private boolean serverShutdownQueued;
 
     ClientConnection(
             NioChatServer server,
@@ -56,6 +58,7 @@ final class ClientConnection implements ClientConnectionContext {
         this.channel = channel;
         this.inboundQueueCapacity = outboundQueueCapacity;
         this.outboundQueueCapacity = outboundQueueCapacity;
+        remoteAddress = remoteAddress(channel);
     }
 
     void attach(SelectionKey key) {
@@ -70,7 +73,8 @@ final class ClientConnection implements ClientConnectionContext {
         while (true) {
             int read = channel.read(readBuffer);
             if (read == -1) {
-                close();
+                server.logAccess("REMOTE_CLOSE", "remote", remoteAddress);
+                close("remote_close");
                 return;
             }
             if (read == 0) {
@@ -87,6 +91,7 @@ final class ClientConnection implements ClientConnectionContext {
                         line = decodeAccumulatedLine();
                     } catch (CharacterCodingException exception) {
                         lineBuffer.reset();
+                        server.logAccess("PROTOCOL_MALFORMED", "reason", "invalid_utf8", "remote", remoteAddress);
                         failWithErrorAndClose(ProtocolErrorCode.MALFORMED_COMMAND, INVALID_UTF8);
                         return;
                     }
@@ -177,6 +182,7 @@ final class ClientConnection implements ClientConnectionContext {
             return;
         }
 
+        logForcedClose(errorCode, message);
         closeAfterWrites = true;
         disableReadInterest();
         inboundLines.clear();
@@ -192,7 +198,8 @@ final class ClientConnection implements ClientConnectionContext {
 
     void closeIfIdle(long nowNanos, long idleTimeoutNanos) {
         if (!closed && nowNanos - lastActivityNanos >= idleTimeoutNanos) {
-            close();
+            server.logAccess("CONNECTION_TIMEOUT", "remote", remoteAddress);
+            close("timeout");
         }
     }
 
@@ -202,10 +209,39 @@ final class ClientConnection implements ClientConnectionContext {
     }
 
     void close() {
+        close("close");
+    }
+
+    void closeDueToException(Throwable failure) {
+        server.logAccessError("CONNECTION_EXCEPTION", failure, "remote", remoteAddress);
+        close("io_exception");
+    }
+
+    void closeAfterDrainingQueuedWrites() {
+        if (closed) {
+            return;
+        }
+
+        drainQueuedWrites();
+        close("server_shutdown");
+    }
+
+    void sendServerShutdownAndClose(String line) {
+        if (closed || serverShutdownQueued) {
+            return;
+        }
+
+        serverShutdownQueued = true;
+        enqueueLine(line);
+        markCloseAfterWrites();
+    }
+
+    private void close(String reason) {
         if (closed) {
             return;
         }
         closed = true;
+        server.logAccess("CONNECTION_CLOSED", "reason", reason, "remote", remoteAddress);
         if (key != null) {
             key.cancel();
         }
@@ -245,6 +281,21 @@ final class ClientConnection implements ClientConnectionContext {
         return !closed;
     }
 
+    @Override
+    public String remoteAddress() {
+        return remoteAddress;
+    }
+
+    @Override
+    public void logAccess(String event, Object... details) {
+        server.logAccess(event, details);
+    }
+
+    @Override
+    public void logAccessError(String event, Throwable failure, Object... details) {
+        server.logAccessError(event, failure, details);
+    }
+
     private void dispatchLine(String line) {
         if (inboundLines.size() >= inboundQueueCapacity) {
             failWithErrorAndClose(ProtocolErrorCode.CAPACITY_EXCEEDED, INBOUND_QUEUE_FULL);
@@ -266,12 +317,26 @@ final class ClientConnection implements ClientConnectionContext {
                 try {
                     server.handleClientLine(this, line);
                 } catch (RuntimeException exception) {
+                    server.logAccessError(
+                            "UNEXPECTED_EXCEPTION",
+                            exception,
+                            "component", "command_handler",
+                            "remote", remoteAddress,
+                            "line", line
+                    );
                     closeWithError(ProtocolErrorCode.INTERNAL_ERROR, INTERNAL_ERROR);
                 } finally {
                     reactor.commandHandled(this);
                 }
             });
         } catch (RuntimeException exception) {
+            server.logAccessError(
+                    "UNEXPECTED_EXCEPTION",
+                    exception,
+                    "component", "business_pool",
+                    "remote", remoteAddress,
+                    "line", line
+            );
             commandRunning = false;
             failWithErrorAndClose(ProtocolErrorCode.INTERNAL_ERROR, INTERNAL_ERROR);
         }
@@ -301,7 +366,7 @@ final class ClientConnection implements ClientConnectionContext {
 
     private void enableWriteInterest() {
         if (key == null || !key.isValid()) {
-            close();
+            close("invalid_selection_key");
             return;
         }
         key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
@@ -322,6 +387,62 @@ final class ClientConnection implements ClientConnectionContext {
             channel.close();
         } catch (IOException ignored) {
             // Closing is best-effort during reactor shutdown.
+        }
+    }
+
+    private void drainQueuedWrites() {
+        while (!outbound.isEmpty()) {
+            ByteBuffer buffer = outbound.peek();
+            try {
+                int written = channel.write(buffer);
+                if (written > 0) {
+                    touch();
+                }
+                if (buffer.hasRemaining()) {
+                    return;
+                }
+                outbound.remove();
+            } catch (IOException exception) {
+                server.logAccessError("CONNECTION_EXCEPTION", exception, "remote", remoteAddress);
+                return;
+            }
+        }
+    }
+
+    private void logForcedClose(ProtocolErrorCode errorCode, String message) {
+        if (errorCode == ProtocolErrorCode.TOO_LONG) {
+            server.logAccess("PROTOCOL_TOO_LONG", "message", message, "remote", remoteAddress);
+            return;
+        }
+        if (errorCode == ProtocolErrorCode.CAPACITY_EXCEEDED) {
+            server.logAccess(
+                    "QUEUE_OVERFLOW",
+                    "direction", queueDirection(message),
+                    "message", message,
+                    "remote", remoteAddress
+            );
+            return;
+        }
+        if (errorCode == ProtocolErrorCode.INTERNAL_ERROR) {
+            server.logAccess("CONNECTION_INTERNAL_ERROR", "message", message, "remote", remoteAddress);
+        }
+    }
+
+    private String queueDirection(String message) {
+        if (INBOUND_QUEUE_FULL.equals(message)) {
+            return "inbound";
+        }
+        if (OUTBOUND_QUEUE_FULL.equals(message)) {
+            return "outbound";
+        }
+        return "unknown";
+    }
+
+    private String remoteAddress(SocketChannel channel) {
+        try {
+            return String.valueOf(channel.getRemoteAddress());
+        } catch (IOException exception) {
+            return "unknown";
         }
     }
 }

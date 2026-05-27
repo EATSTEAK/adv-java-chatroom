@@ -1,6 +1,8 @@
 package dev.eatsteak.jchatroom.server;
 
+import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Objects;
 
 public record ServerConfig(
         int port,
@@ -8,13 +10,15 @@ public record ServerConfig(
         int businessThreads,
         int maxClients,
         int outboundQueueCapacity,
-        int idleTimeoutSeconds
+        int idleTimeoutSeconds,
+        Path accessLogFile
 ) {
     static final int DEFAULT_PORT = 5000;
     static final int DEFAULT_BUSINESS_THREADS = 32;
     static final int DEFAULT_MAX_CLIENTS = 1024;
     static final int DEFAULT_OUTBOUND_QUEUE_CAPACITY = 100;
     static final int DEFAULT_IDLE_TIMEOUT_SECONDS = 600;
+    static final Path DEFAULT_ACCESS_LOG_FILE = Path.of("logs", "access.log");
 
     public ServerConfig {
         validatePort(port);
@@ -23,6 +27,26 @@ public record ServerConfig(
         requirePositive("maxClients", maxClients);
         requirePositive("outboundQueueCapacity", outboundQueueCapacity);
         requirePositive("idleTimeoutSeconds", idleTimeoutSeconds);
+        Objects.requireNonNull(accessLogFile, "accessLogFile");
+    }
+
+    public ServerConfig(
+            int port,
+            int reactorThreads,
+            int businessThreads,
+            int maxClients,
+            int outboundQueueCapacity,
+            int idleTimeoutSeconds
+    ) {
+        this(
+                port,
+                reactorThreads,
+                businessThreads,
+                maxClients,
+                outboundQueueCapacity,
+                idleTimeoutSeconds,
+                DEFAULT_ACCESS_LOG_FILE
+        );
     }
 
     public static ServerConfig defaults() {
@@ -32,7 +56,8 @@ public record ServerConfig(
                 DEFAULT_BUSINESS_THREADS,
                 DEFAULT_MAX_CLIENTS,
                 DEFAULT_OUTBOUND_QUEUE_CAPACITY,
-                DEFAULT_IDLE_TIMEOUT_SECONDS
+                DEFAULT_IDLE_TIMEOUT_SECONDS,
+                DEFAULT_ACCESS_LOG_FILE
         );
     }
 
@@ -44,6 +69,7 @@ public record ServerConfig(
         int maxClients = defaults.maxClients();
         int outboundQueueCapacity = defaults.outboundQueueCapacity();
         int idleTimeoutSeconds = defaults.idleTimeoutSeconds();
+        Path accessLogFile = defaults.accessLogFile();
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -68,14 +94,14 @@ public record ServerConfig(
                 value = args[++i];
             }
 
-            int parsedValue = parseInteger(flag, value);
             switch (normalizeFlag(flag)) {
-                case "port" -> port = parsedValue;
-                case "reactor-threads" -> reactorThreads = parsedValue;
-                case "business-threads" -> businessThreads = parsedValue;
-                case "max-clients" -> maxClients = parsedValue;
-                case "queue-capacity" -> outboundQueueCapacity = parsedValue;
-                case "idle-timeout-seconds" -> idleTimeoutSeconds = parsedValue;
+                case "port" -> port = parseInteger(flag, value);
+                case "reactor-threads" -> reactorThreads = parseInteger(flag, value);
+                case "business-threads" -> businessThreads = parseInteger(flag, value);
+                case "max-clients" -> maxClients = parseInteger(flag, value);
+                case "queue-capacity" -> outboundQueueCapacity = parseInteger(flag, value);
+                case "idle-timeout-seconds" -> idleTimeoutSeconds = parseInteger(flag, value);
+                case "log-file" -> accessLogFile = parsePath(flag, value);
                 default -> throw new IllegalArgumentException("Unknown option: --" + flag);
             }
         }
@@ -86,7 +112,8 @@ public record ServerConfig(
                 businessThreads,
                 maxClients,
                 outboundQueueCapacity,
-                idleTimeoutSeconds
+                idleTimeoutSeconds,
+                accessLogFile
         );
     }
 
@@ -104,6 +131,13 @@ public record ServerConfig(
 
     private static String normalizeFlag(String flag) {
         return flag.toLowerCase(Locale.ROOT);
+    }
+
+    private static Path parsePath(String flag, String value) {
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("Missing value for --" + flag);
+        }
+        return Path.of(value);
     }
 
     private static void validatePort(int port) {

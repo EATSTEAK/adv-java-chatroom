@@ -14,4 +14,14 @@ interface ClientConnectionContext {
     default boolean isOpen() {
         return true;
     }
+
+    default String remoteAddress() {
+        return "unknown";
+    }
+
+    default void logAccess(String event, Object... details) {
+    }
+
+    default void logAccessError(String event, Throwable failure, Object... details) {
+    }
 }

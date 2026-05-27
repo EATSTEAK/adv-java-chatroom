@@ -85,11 +85,21 @@ final class BossReactor implements Runnable {
 
             client.configureBlocking(false);
             if (!server.tryReserveClient()) {
+                server.logAccess("CONNECTION_REJECTED", "reason", "server_full", "remote", remoteAddress(client));
                 client.close();
                 continue;
             }
 
+            server.logAccess("CONNECTION_ACCEPTED", "remote", remoteAddress(client));
             workerForNextClient().register(client);
+        }
+    }
+
+    private String remoteAddress(SocketChannel client) {
+        try {
+            return String.valueOf(client.getRemoteAddress());
+        } catch (IOException exception) {
+            return "unknown";
         }
     }
 

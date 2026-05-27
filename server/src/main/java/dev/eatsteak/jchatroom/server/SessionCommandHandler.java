@@ -45,7 +45,7 @@ final class SessionCommandHandler implements ClientCommandHandler {
         try {
             protocolLine = ProtocolParser.parseLine(line);
         } catch (ProtocolException exception) {
-            handleProtocolException(connection, exception);
+            handleProtocolException(connection, line, exception);
             return;
         }
 
@@ -59,7 +59,7 @@ final class SessionCommandHandler implements ClientCommandHandler {
         try {
             request = ProtocolParser.parseRequest(line);
         } catch (ProtocolException exception) {
-            handleProtocolException(connection, exception);
+            handleProtocolException(connection, line, exception);
             return;
         }
 
@@ -78,6 +78,11 @@ final class SessionCommandHandler implements ClientCommandHandler {
         }
 
         if (request instanceof ClientRequest.Login) {
+            connection.logAccess(
+                    "LOGIN_FAILURE",
+                    "reason", "already_logged_in",
+                    "remote", connection.remoteAddress()
+            );
             session.sendLineIfActive(
                     ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, ALREADY_LOGGED_IN_MESSAGE)
             );
@@ -123,21 +128,50 @@ final class SessionCommandHandler implements ClientCommandHandler {
     private void handleLogin(ClientConnectionContext connection, ClientRequest.Login login) {
         SessionManager.LoginResult result = sessions.login(connection, login.username());
         switch (result.status()) {
-            case SUCCESS -> result.session().sendLineIfActive(ProtocolFormatter.ok(RequestType.LOGIN, login.username()));
-            case DUPLICATE_USERNAME -> connection.sendLine(
-                    ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, DUPLICATE_USERNAME_MESSAGE)
-            );
-            case ALREADY_LOGGED_IN -> connection.sendLine(
-                    ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, ALREADY_LOGGED_IN_MESSAGE)
-            );
+            case SUCCESS -> {
+                connection.logAccess(
+                        "LOGIN_SUCCESS",
+                        "username", login.username(),
+                        "remote", connection.remoteAddress()
+                );
+                result.session().sendLineIfActive(ProtocolFormatter.ok(RequestType.LOGIN, login.username()));
+            }
+            case DUPLICATE_USERNAME -> {
+                connection.logAccess(
+                        "LOGIN_DUPLICATE",
+                        "username", login.username(),
+                        "remote", connection.remoteAddress()
+                );
+                connection.sendLine(ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, DUPLICATE_USERNAME_MESSAGE));
+            }
+            case ALREADY_LOGGED_IN -> {
+                connection.logAccess(
+                        "LOGIN_FAILURE",
+                        "username", login.username(),
+                        "reason", "already_logged_in",
+                        "remote", connection.remoteAddress()
+                );
+                connection.sendLine(ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, ALREADY_LOGGED_IN_MESSAGE));
+            }
             case CONNECTION_CLOSED -> {
+                connection.logAccess(
+                        "LOGIN_FAILURE",
+                        "username", login.username(),
+                        "reason", "connection_closed",
+                        "remote", connection.remoteAddress()
+                );
                 // Close cleanup won the race; no response can be delivered.
             }
         }
     }
 
     private void handleQuit(ClientConnectionContext connection) {
-        removeSession(connection);
+        Session removed = removeSession(connection);
+        connection.logAccess(
+                "QUIT",
+                "username", removed == null ? "" : removed.username(),
+                "remote", connection.remoteAddress()
+        );
         connection.sendLine(ProtocolFormatter.ok(RequestType.QUIT));
         connection.closeAfterWrites();
     }
@@ -160,12 +194,25 @@ final class SessionCommandHandler implements ClientCommandHandler {
             return;
         }
         if (result.status() == RoomManager.CreateStatus.ALREADY_EXISTS) {
+            session.connection().logAccess(
+                    "ROOM_CREATE_FAILURE",
+                    "username", session.username(),
+                    "room", roomName,
+                    "reason", "room_already_exists",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(
                     ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, ROOM_ALREADY_EXISTS_MESSAGE)
             );
             return;
         }
 
+        session.connection().logAccess(
+                "ROOM_CREATE",
+                "username", session.username(),
+                "room", roomName,
+                "remote", session.connection().remoteAddress()
+        );
         session.sendLineIfActive(ProtocolFormatter.ok(RequestType.ROOM_CREATE, roomName));
         sendEvent(result.members(), "ROOM_CREATE", List.of(roomName, session.username()));
     }
@@ -176,10 +223,24 @@ final class SessionCommandHandler implements ClientCommandHandler {
             return;
         }
         if (result.status() == RoomManager.JoinStatus.NOT_FOUND) {
+            session.connection().logAccess(
+                    "ROOM_JOIN_FAILURE",
+                    "username", session.username(),
+                    "room", roomName,
+                    "reason", "room_not_found",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(ProtocolFormatter.error(ProtocolErrorCode.NOT_FOUND, ROOM_NOT_FOUND_MESSAGE));
             return;
         }
 
+        session.connection().logAccess(
+                "ROOM_JOIN",
+                "username", session.username(),
+                "room", roomName,
+                "status", result.status(),
+                "remote", session.connection().remoteAddress()
+        );
         session.sendLineIfActive(ProtocolFormatter.ok(RequestType.ROOM_JOIN, roomName));
         if (result.status() == RoomManager.JoinStatus.JOINED) {
             sendEvent(result.members(), "ROOM_JOIN", List.of(roomName, session.username()));
@@ -192,16 +253,36 @@ final class SessionCommandHandler implements ClientCommandHandler {
             return;
         }
         if (result.status() == RoomManager.LeaveStatus.NOT_FOUND) {
+            session.connection().logAccess(
+                    "ROOM_LEAVE_FAILURE",
+                    "username", session.username(),
+                    "room", roomName,
+                    "reason", "room_not_found",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(ProtocolFormatter.error(ProtocolErrorCode.NOT_FOUND, ROOM_NOT_FOUND_MESSAGE));
             return;
         }
         if (result.status() == RoomManager.LeaveStatus.NOT_MEMBER) {
+            session.connection().logAccess(
+                    "ROOM_LEAVE_FAILURE",
+                    "username", session.username(),
+                    "room", roomName,
+                    "reason", "not_room_member",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(
                     ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, NOT_ROOM_MEMBER_MESSAGE)
             );
             return;
         }
 
+        session.connection().logAccess(
+                "ROOM_LEAVE",
+                "username", session.username(),
+                "room", roomName,
+                "remote", session.connection().remoteAddress()
+        );
         session.sendLineIfActive(ProtocolFormatter.ok(RequestType.ROOM_LEAVE, roomName));
         sendEvent(result.remainingMembers(), "ROOM_LEAVE", List.of(roomName, session.username()));
     }
@@ -219,16 +300,40 @@ final class SessionCommandHandler implements ClientCommandHandler {
             return;
         }
         if (targets.status() == RoomManager.MessageTargetStatus.NOT_FOUND) {
+            session.connection().logAccess(
+                    "MSG_FAILURE",
+                    "username", session.username(),
+                    "room", message.room(),
+                    "message", message.message(),
+                    "reason", "room_not_found",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(ProtocolFormatter.error(ProtocolErrorCode.NOT_FOUND, ROOM_NOT_FOUND_MESSAGE));
             return;
         }
         if (targets.status() == RoomManager.MessageTargetStatus.NOT_MEMBER) {
+            session.connection().logAccess(
+                    "MSG_FAILURE",
+                    "username", session.username(),
+                    "room", message.room(),
+                    "message", message.message(),
+                    "reason", "not_room_member",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(
                     ProtocolFormatter.error(ProtocolErrorCode.INVALID_STATE, NOT_ROOM_MEMBER_MESSAGE)
             );
             return;
         }
 
+        session.connection().logAccess(
+                "MSG",
+                "username", session.username(),
+                "room", message.room(),
+                "message", message.message(),
+                "recipients", targets.members().size(),
+                "remote", session.connection().remoteAddress()
+        );
         sendEvent(
                 targets.members(),
                 "MSG",
@@ -240,10 +345,25 @@ final class SessionCommandHandler implements ClientCommandHandler {
     private void handleWhisper(Session session, ClientRequest.Whisper whisper) {
         Session target = sessions.sessionForUsername(whisper.username());
         if (target == null) {
+            session.connection().logAccess(
+                    "WHISPER_FAILURE",
+                    "from", session.username(),
+                    "to", whisper.username(),
+                    "message", whisper.message(),
+                    "reason", "user_not_found",
+                    "remote", session.connection().remoteAddress()
+            );
             session.sendLineIfActive(ProtocolFormatter.error(ProtocolErrorCode.NOT_FOUND, USER_NOT_FOUND_MESSAGE));
             return;
         }
 
+        session.connection().logAccess(
+                "WHISPER",
+                "from", session.username(),
+                "to", whisper.username(),
+                "message", whisper.message(),
+                "remote", session.connection().remoteAddress()
+        );
         session.sendLineIfActive(ProtocolFormatter.ok(RequestType.WHISPER, whisper.username()));
         target.sendLineIfActive(ProtocolFormatter.event(
                 "WHISPER",
@@ -266,18 +386,27 @@ final class SessionCommandHandler implements ClientCommandHandler {
         }
     }
 
-    private void removeSession(ClientConnectionContext connection) {
+    private Session removeSession(ClientConnectionContext connection) {
         Session removed = sessions.remove(connection);
         if (removed != null) {
             rooms.removeFromAll(removed);
         }
+        return removed;
     }
 
     private boolean isPreLoginCommand(String command) {
         return "LOGIN".equals(command) || "QUIT".equals(command);
     }
 
-    private void handleProtocolException(ClientConnectionContext connection, ProtocolException exception) {
+    private void handleProtocolException(ClientConnectionContext connection, String line, ProtocolException exception) {
+        if (line.startsWith("LOGIN")) {
+            connection.logAccess(
+                    "LOGIN_FAILURE",
+                    "reason", exception.errorCode(),
+                    "line", line,
+                    "remote", connection.remoteAddress()
+            );
+        }
         if (exception.errorCode() == ProtocolErrorCode.TOO_LONG) {
             connection.closeWithError(ProtocolErrorCode.TOO_LONG, TOO_LONG_MESSAGE);
             return;

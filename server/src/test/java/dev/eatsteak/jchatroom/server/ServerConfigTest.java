@@ -2,6 +2,8 @@ package dev.eatsteak.jchatroom.server;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -16,6 +18,7 @@ class ServerConfigTest {
         assertEquals(1024, config.maxClients());
         assertEquals(100, config.outboundQueueCapacity());
         assertEquals(600, config.idleTimeoutSeconds());
+        assertEquals(Path.of("logs", "access.log"), config.accessLogFile());
     }
 
     @Test
@@ -26,7 +29,8 @@ class ServerConfigTest {
                 "--business-threads", "4",
                 "--max-clients", "64",
                 "--queue-capacity", "12",
-                "--idle-timeout-seconds", "30"
+                "--idle-timeout-seconds", "30",
+                "--log-file", "var/jchat/access.log"
         );
 
         assertEquals(6000, config.port());
@@ -35,6 +39,7 @@ class ServerConfigTest {
         assertEquals(64, config.maxClients());
         assertEquals(12, config.outboundQueueCapacity());
         assertEquals(30, config.idleTimeoutSeconds());
+        assertEquals(Path.of("var/jchat/access.log"), config.accessLogFile());
     }
 
     @Test
@@ -45,7 +50,8 @@ class ServerConfigTest {
                 "--business-threads=1",
                 "--max-clients=2",
                 "--queue-capacity=3",
-                "--idle-timeout-seconds=4"
+                "--idle-timeout-seconds=4",
+                "--log-file=out/access.log"
         );
 
         assertEquals(0, config.port());
@@ -54,6 +60,7 @@ class ServerConfigTest {
         assertEquals(2, config.maxClients());
         assertEquals(3, config.outboundQueueCapacity());
         assertEquals(4, config.idleTimeoutSeconds());
+        assertEquals(Path.of("out/access.log"), config.accessLogFile());
     }
 
     @Test
@@ -65,5 +72,6 @@ class ServerConfigTest {
     void rejectsInvalidValues() {
         assertThrows(IllegalArgumentException.class, () -> ServerConfig.fromArgs("--port", "65536"));
         assertThrows(IllegalArgumentException.class, () -> ServerConfig.fromArgs("--reactor-threads", "0"));
+        assertThrows(IllegalArgumentException.class, () -> ServerConfig.fromArgs("--log-file", " "));
     }
 }

@@ -1,21 +1,26 @@
 package dev.eatsteak.jchatroom.server;
 
+import dev.eatsteak.jchatroom.common.protocol.ProtocolFormatter;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class NioChatServer implements AutoCloseable {
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(5);
+    private static final String SHUTDOWN_MESSAGE = "server is shutting down";
 
     private final ServerConfig config;
     private final ClientCommandHandler commandHandler;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicInteger clientCount = new AtomicInteger();
 
+    private AccessLogger accessLogger;
     private BusinessWorkerPool businessPool;
     private WorkerReactor[] workers;
     private BossReactor boss;
@@ -36,6 +41,7 @@ public final class NioChatServer implements AutoCloseable {
         }
 
         try {
+            accessLogger = new AccessLogger(config.accessLogFile());
             businessPool = new BusinessWorkerPool(config);
             workers = createWorkers();
             for (WorkerReactor worker : workers) {
@@ -47,8 +53,19 @@ public final class NioChatServer implements AutoCloseable {
             serverChannel.bind(new InetSocketAddress(config.port()));
             boss = new BossReactor(this, serverChannel, workers);
             boss.start();
+            logAccess(
+                    "SERVER_START",
+                    "configured_port", config.port(),
+                    "bound_port", port(),
+                    "reactor_threads", config.reactorThreads(),
+                    "business_threads", config.businessThreads(),
+                    "max_clients", config.maxClients(),
+                    "log_file", accessLogger.logFile().toAbsolutePath()
+            );
         } catch (IOException | RuntimeException exception) {
+            logAccessError("SERVER_START_FAILURE", exception);
             shutdown();
+            closeAccessLogger();
             throw exception;
         }
     }
@@ -65,13 +82,16 @@ public final class NioChatServer implements AutoCloseable {
             return;
         }
 
-        shutdownCommandHandler();
+        logAccess("SERVER_SHUTDOWN", "message", SHUTDOWN_MESSAGE);
 
         if (boss != null) {
             boss.shutdown();
         } else {
             closeServerChannel();
         }
+
+        notifyClientsServerShutdown();
+        shutdownCommandHandler();
 
         if (workers != null) {
             for (WorkerReactor worker : workers) {
@@ -102,6 +122,7 @@ public final class NioChatServer implements AutoCloseable {
                 // Keep waiting for the bounded business pool to exit.
             }
         }
+        closeAccessLogger();
     }
 
     public boolean awaitTermination(Duration timeout) throws InterruptedException {
@@ -118,6 +139,9 @@ public final class NioChatServer implements AutoCloseable {
         }
         if (businessPool != null) {
             stopped &= businessPool.awaitTermination(remaining(deadline));
+        }
+        if (stopped) {
+            closeAccessLogger();
         }
         return stopped;
     }
@@ -160,7 +184,22 @@ public final class NioChatServer implements AutoCloseable {
 
     void reactorFailed(Throwable failure) {
         Objects.requireNonNull(failure, "failure");
+        logAccessError("REACTOR_FAILURE", failure);
         shutdown();
+    }
+
+    void logAccess(String event, Object... details) {
+        AccessLogger logger = accessLogger;
+        if (logger != null) {
+            logger.info(event, details);
+        }
+    }
+
+    void logAccessError(String event, Throwable failure, Object... details) {
+        AccessLogger logger = accessLogger;
+        if (logger != null) {
+            logger.error(event, failure, details);
+        }
     }
 
     int clientCount() {
@@ -206,11 +245,33 @@ public final class NioChatServer implements AutoCloseable {
         }
     }
 
+    private void notifyClientsServerShutdown() {
+        if (workers == null) {
+            return;
+        }
+
+        String event = ProtocolFormatter.event("SERVER_SHUTDOWN", List.of(), SHUTDOWN_MESSAGE);
+        for (WorkerReactor worker : workers) {
+            try {
+                worker.notifyServerShutdown(event);
+            } catch (RuntimeException exception) {
+                logAccessError("SERVER_SHUTDOWN_NOTIFY_FAILURE", exception, "worker", worker.toString());
+            }
+        }
+    }
+
     private void shutdownCommandHandler() {
         try {
             commandHandler.shutdown();
         } catch (RuntimeException ignored) {
             // Server shutdown continues even if command-layer cleanup is already complete.
+        }
+    }
+
+    private void closeAccessLogger() {
+        AccessLogger logger = accessLogger;
+        if (logger != null) {
+            logger.close();
         }
     }
 

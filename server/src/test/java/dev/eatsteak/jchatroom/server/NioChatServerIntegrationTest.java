@@ -3,6 +3,7 @@ package dev.eatsteak.jchatroom.server;
 import dev.eatsteak.jchatroom.common.protocol.ProtocolValidator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -11,6 +12,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +26,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class NioChatServerIntegrationTest {
+    @TempDir
+    Path tempDir;
+
     @Test
     @Timeout(5)
     void loginSuccessReturnsUsername() throws Exception {
@@ -40,6 +46,43 @@ class NioChatServerIntegrationTest {
             server.shutdown();
             assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
         }
+    }
+
+    @Test
+    @Timeout(5)
+    void accessLogFileRecordsLoginRoomAndMessage() throws Exception {
+        Path logFile = tempDir.resolve("nested/access.log");
+        NioChatServer server = new NioChatServer(testConfig(logFile));
+        try {
+            server.start();
+
+            try (Socket socket = connect(server.port())) {
+                BufferedReader reader = reader(socket);
+
+                writeLine(socket, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", reader.readLine());
+                writeLine(socket, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", reader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", reader.readLine());
+                writeLine(socket, "MSG lobby :hello room");
+                assertEquals("EVENT MSG lobby alpha :hello room", reader.readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+
+        assertTrue(Files.exists(logFile));
+        String log = Files.readString(logFile);
+        assertTrue(log.contains("event=\"SERVER_START\""));
+        assertTrue(log.contains("event=\"CONNECTION_ACCEPTED\""));
+        assertTrue(log.contains("event=\"LOGIN_SUCCESS\""));
+        assertTrue(log.contains("username=\"alpha\""));
+        assertTrue(log.contains("event=\"ROOM_CREATE\""));
+        assertTrue(log.contains("room=\"lobby\""));
+        assertTrue(log.contains("event=\"MSG\""));
+        assertTrue(log.contains("message=\"hello room\""));
+        assertTrue(log.contains("event=\"SERVER_SHUTDOWN\""));
     }
 
     @Test
@@ -253,7 +296,7 @@ class NioChatServerIntegrationTest {
     @Timeout(5)
     void outboundQueueOverflowReturnsErrorAndClosesConnection() throws Exception {
         NioChatServer server = new NioChatServer(
-                new ServerConfig(0, 1, 1, 16, 1, 600),
+                testConfig(0, 1, 1, 16, 1, 600),
                 (connection, line) -> {
                     connection.sendLine("OK LOGIN");
                     connection.sendLine("OK LIST USERS");
@@ -282,7 +325,7 @@ class NioChatServerIntegrationTest {
         CountDownLatch releaseHandler = new CountDownLatch(1);
         CountDownLatch handlerFinished = new CountDownLatch(1);
         NioChatServer server = new NioChatServer(
-                new ServerConfig(0, 1, 1, 16, 1, 600),
+                testConfig(0, 1, 1, 16, 1, 600),
                 (connection, line) -> {
                     handlerStarted.countDown();
                     try {
@@ -316,7 +359,7 @@ class NioChatServerIntegrationTest {
     @Test
     @Timeout(5)
     void idleTimeoutClosesInactiveConnectionAndRemovesSession() throws Exception {
-        NioChatServer server = new NioChatServer(new ServerConfig(0, 1, 1, 16, 8, 1));
+        NioChatServer server = new NioChatServer(testConfig(0, 1, 1, 16, 8, 1));
         try {
             server.start();
 
@@ -617,7 +660,7 @@ class NioChatServerIntegrationTest {
     @Timeout(5)
     void opWriteDrainsQueuedOutputWithoutHanging() throws Exception {
         NioChatServer server = new NioChatServer(
-                new ServerConfig(0, 1, 1, 16, 64, 600),
+                testConfig(0, 1, 1, 16, 64, 600),
                 (connection, line) -> {
                     for (int i = 0; i < 20; i++) {
                         connection.sendLine("OK LOGIN " + i);
@@ -661,6 +704,37 @@ class NioChatServerIntegrationTest {
             assertFalse(server.isRunning());
             assertEquals(0, server.clientCount());
             assertEquals(0, server.activeSessionCount());
+            assertEquals("EVENT SERVER_SHUTDOWN :server is shutting down", reader.readLine());
+            assertNull(reader.readLine());
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+            server.close();
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void shutdownNotifiesUnauthenticatedClientBeforeClosing() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        Socket socket = null;
+        try {
+            server.start();
+            socket = connect(server.port());
+            BufferedReader reader = reader(socket);
+
+            writeLine(socket, "LIST USERS");
+            assertEquals("ERR 401 :login required", reader.readLine());
+            assertEquals(1, server.clientCount());
+            assertEquals(0, server.activeSessionCount());
+
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+            assertFalse(server.isRunning());
+            assertEquals(0, server.clientCount());
+            assertEquals(0, server.activeSessionCount());
+            assertEquals("EVENT SERVER_SHUTDOWN :server is shutting down", reader.readLine());
             assertNull(reader.readLine());
         } finally {
             if (socket != null) {
@@ -692,6 +766,7 @@ class NioChatServerIntegrationTest {
             assertFalse(server.isRunning());
             assertEquals(0, server.clientCount());
             assertEquals(0, server.activeSessionCount());
+            assertEquals("EVENT SERVER_SHUTDOWN :server is shutting down", reader.readLine());
             assertNull(reader.readLine());
         } finally {
             if (socket != null) {
@@ -701,8 +776,31 @@ class NioChatServerIntegrationTest {
         }
     }
 
-    private static ServerConfig testConfig() {
-        return new ServerConfig(0, 2, 2, 16, 8, 600);
+    private ServerConfig testConfig() {
+        return testConfig(0, 2, 2, 16, 8, 600);
+    }
+
+    private ServerConfig testConfig(
+            int port,
+            int reactorThreads,
+            int businessThreads,
+            int maxClients,
+            int outboundQueueCapacity,
+            int idleTimeoutSeconds
+    ) {
+        return new ServerConfig(
+                port,
+                reactorThreads,
+                businessThreads,
+                maxClients,
+                outboundQueueCapacity,
+                idleTimeoutSeconds,
+                tempDir.resolve("access.log")
+        );
+    }
+
+    private ServerConfig testConfig(Path logFile) {
+        return new ServerConfig(0, 2, 2, 16, 8, 600, logFile);
     }
 
     private static Socket connect(int port) throws IOException {

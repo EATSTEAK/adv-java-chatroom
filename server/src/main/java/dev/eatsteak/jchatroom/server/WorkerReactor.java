@@ -9,6 +9,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.util.Iterator;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -27,6 +28,7 @@ final class WorkerReactor implements Runnable {
     private final ConcurrentLinkedQueue<Runnable> pendingTasks = new ConcurrentLinkedQueue<>();
     private final Set<ClientConnection> connections = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean running = new AtomicBoolean(true);
+    private volatile String serverShutdownLine;
 
     WorkerReactor(
             NioChatServer server,
@@ -49,6 +51,7 @@ final class WorkerReactor implements Runnable {
 
     void register(SocketChannel channel) {
         if (!running.get()) {
+            server.logAccess("CONNECTION_REJECTED", "reason", "reactor_stopped", "remote", remoteAddress(channel));
             closeQuietly(channel);
             server.releaseClient();
             return;
@@ -57,6 +60,7 @@ final class WorkerReactor implements Runnable {
         Runnable task = () -> registerOnReactor(channel);
         pendingTasks.add(task);
         if (!running.get() && pendingTasks.remove(task)) {
+            server.logAccess("CONNECTION_REJECTED", "reason", "reactor_stopped", "remote", remoteAddress(channel));
             closeQuietly(channel);
             server.releaseClient();
             return;
@@ -86,6 +90,15 @@ final class WorkerReactor implements Runnable {
 
     void remove(ClientConnection connection) {
         connections.remove(connection);
+    }
+
+    void notifyServerShutdown(String line) {
+        serverShutdownLine = Objects.requireNonNull(line, "line");
+        schedule(() -> {
+            for (ClientConnection connection : connections.toArray(ClientConnection[]::new)) {
+                connection.sendServerShutdownAndClose(line);
+            }
+        });
     }
 
     void shutdown() {
@@ -123,7 +136,7 @@ final class WorkerReactor implements Runnable {
     }
 
     private void registerOnReactor(SocketChannel channel) {
-        if (!running.get()) {
+        if (!running.get() && serverShutdownLine == null) {
             closeQuietly(channel);
             server.releaseClient();
             return;
@@ -135,7 +148,11 @@ final class WorkerReactor implements Runnable {
             connection.attach(key);
             key.attach(connection);
             connections.add(connection);
+            if (serverShutdownLine != null) {
+                connection.sendServerShutdownAndClose(serverShutdownLine);
+            }
         } catch (IOException | RuntimeException exception) {
+            server.logAccessError("CONNECTION_REGISTER_FAILURE", exception, "remote", remoteAddress(channel));
             closeQuietly(channel);
             server.releaseClient();
         }
@@ -167,7 +184,7 @@ final class WorkerReactor implements Runnable {
                     connection.writeReady();
                 }
             } catch (IOException | CancelledKeyException exception) {
-                connection.close();
+                connection.closeDueToException(exception);
             }
         }
     }
@@ -194,7 +211,7 @@ final class WorkerReactor implements Runnable {
 
     private void closeConnections() {
         for (ClientConnection connection : connections.toArray(ClientConnection[]::new)) {
-            connection.close();
+            connection.closeAfterDrainingQueuedWrites();
         }
     }
 
@@ -211,6 +228,14 @@ final class WorkerReactor implements Runnable {
             channel.close();
         } catch (IOException ignored) {
             // Registration failures are already handled by releasing the client slot.
+        }
+    }
+
+    private String remoteAddress(SocketChannel channel) {
+        try {
+            return String.valueOf(channel.getRemoteAddress());
+        } catch (IOException exception) {
+            return "unknown";
         }
     }
 

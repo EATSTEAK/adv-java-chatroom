@@ -105,6 +105,13 @@ final class SessionManager {
                 .toList();
     }
 
+    synchronized List<Session> activeSessions() {
+        return sessionsByUsername.values().stream()
+                .filter(Session::isActive)
+                .sorted(Comparator.comparing(Session::username))
+                .toList();
+    }
+
     private Session removeConnectionLocked(ClientConnectionContext connection) {
         Session session = sessionsByConnection.remove(connection);
         if (session != null) {
