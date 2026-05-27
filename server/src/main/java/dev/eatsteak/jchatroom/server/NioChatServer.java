@@ -12,6 +12,7 @@ public final class NioChatServer implements AutoCloseable {
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(5);
 
     private final ServerConfig config;
+    private final ClientCommandHandler commandHandler;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicInteger clientCount = new AtomicInteger();
 
@@ -21,7 +22,12 @@ public final class NioChatServer implements AutoCloseable {
     private ServerSocketChannel serverChannel;
 
     public NioChatServer(ServerConfig config) {
+        this(config, PlaceholderCommandHandler.INSTANCE);
+    }
+
+    NioChatServer(ServerConfig config, ClientCommandHandler commandHandler) {
         this.config = Objects.requireNonNull(config, "config");
+        this.commandHandler = Objects.requireNonNull(commandHandler, "commandHandler");
     }
 
     public void start() throws IOException {
@@ -134,6 +140,10 @@ public final class NioChatServer implements AutoCloseable {
         businessPool.execute(task);
     }
 
+    void handleClientLine(ClientConnectionContext connection, String line) {
+        commandHandler.handle(connection, line);
+    }
+
     boolean isRunning() {
         return running.get();
     }
@@ -150,7 +160,12 @@ public final class NioChatServer implements AutoCloseable {
     private WorkerReactor[] createWorkers() throws IOException {
         WorkerReactor[] created = new WorkerReactor[config.reactorThreads()];
         for (int i = 0; i < created.length; i++) {
-            created[i] = new WorkerReactor(this, i, config.outboundQueueCapacity());
+            created[i] = new WorkerReactor(
+                    this,
+                    i,
+                    config.outboundQueueCapacity(),
+                    config.idleTimeoutSeconds()
+            );
         }
         return created;
     }

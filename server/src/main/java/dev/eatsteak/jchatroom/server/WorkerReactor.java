@@ -1,5 +1,7 @@
 package dev.eatsteak.jchatroom.server;
 
+import dev.eatsteak.jchatroom.common.protocol.ProtocolErrorCode;
+
 import java.io.IOException;
 import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectionKey;
@@ -10,22 +12,32 @@ import java.util.Iterator;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class WorkerReactor implements Runnable {
+    private static final long SELECT_TIMEOUT_MILLIS = 250L;
+
     private final NioChatServer server;
     private final int index;
     private final int outboundQueueCapacity;
+    private final long idleTimeoutNanos;
     private final Selector selector;
     private final Thread thread;
     private final ConcurrentLinkedQueue<Runnable> pendingTasks = new ConcurrentLinkedQueue<>();
     private final Set<ClientConnection> connections = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    WorkerReactor(NioChatServer server, int index, int outboundQueueCapacity) throws IOException {
+    WorkerReactor(
+            NioChatServer server,
+            int index,
+            int outboundQueueCapacity,
+            int idleTimeoutSeconds
+    ) throws IOException {
         this.server = server;
         this.index = index;
         this.outboundQueueCapacity = outboundQueueCapacity;
+        idleTimeoutNanos = TimeUnit.SECONDS.toNanos(idleTimeoutSeconds);
         selector = Selector.open();
         thread = new Thread(this, "jchat-worker-reactor-" + index);
         thread.setDaemon(false);
@@ -53,17 +65,23 @@ final class WorkerReactor implements Runnable {
     }
 
     void enqueueWrite(ClientConnection connection, String line) {
-        if (!running.get()) {
-            return;
-        }
+        schedule(() -> connection.enqueueLine(line));
+    }
 
-        Runnable task = () -> connection.enqueueLine(line);
-        pendingTasks.add(task);
-        if (!running.get()) {
-            pendingTasks.remove(task);
-            return;
-        }
-        selector.wakeup();
+    void closeAfterWrites(ClientConnection connection) {
+        schedule(connection::markCloseAfterWrites);
+    }
+
+    void closeWithError(ClientConnection connection, ProtocolErrorCode errorCode, String message) {
+        schedule(() -> connection.failWithErrorAndClose(errorCode, message));
+    }
+
+    void closeNow(ClientConnection connection) {
+        schedule(connection::close);
+    }
+
+    void commandHandled(ClientConnection connection) {
+        schedule(connection::commandHandled);
     }
 
     void remove(ClientConnection connection) {
@@ -90,9 +108,10 @@ final class WorkerReactor implements Runnable {
         try {
             while (running.get()) {
                 runPendingTasks();
-                selector.select();
+                selector.select(SELECT_TIMEOUT_MILLIS);
                 runPendingTasks();
                 processSelectedKeys();
+                sweepIdleConnections();
             }
         } catch (IOException | RuntimeException exception) {
             server.reactorFailed(exception);
@@ -151,6 +170,26 @@ final class WorkerReactor implements Runnable {
                 connection.close();
             }
         }
+    }
+
+    private void sweepIdleConnections() {
+        long now = System.nanoTime();
+        for (ClientConnection connection : connections.toArray(ClientConnection[]::new)) {
+            connection.closeIfIdle(now, idleTimeoutNanos);
+        }
+    }
+
+    private void schedule(Runnable task) {
+        if (!running.get()) {
+            return;
+        }
+
+        pendingTasks.add(task);
+        if (!running.get()) {
+            pendingTasks.remove(task);
+            return;
+        }
+        selector.wakeup();
     }
 
     private void closeConnections() {

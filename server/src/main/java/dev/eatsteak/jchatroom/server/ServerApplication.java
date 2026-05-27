@@ -19,7 +19,7 @@ public final class ServerApplication {
     }
 
     static String startupMessage() {
-        return ProjectInfo.name() + " server Stage 2 NIO lifecycle";
+        return ProjectInfo.name() + " server Stage 3 NIO connection state";
     }
 
     static String startupMessage(ServerConfig config, int boundPort) {
