@@ -1,5 +1,7 @@
 package dev.eatsteak.jchatroom.server;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -32,6 +34,7 @@ final class SessionManager {
 
         if (!connection.isOpen()) {
             removeConnectionLocked(connection);
+            session.deactivate();
             return LoginResult.connectionClosed();
         }
 
@@ -39,27 +42,75 @@ final class SessionManager {
     }
 
     synchronized Session sessionFor(ClientConnectionContext connection) {
-        return sessionsByConnection.get(connection);
+        Session session = sessionsByConnection.get(connection);
+        if (session == null || !session.isActive()) {
+            return null;
+        }
+        return session;
     }
 
-    synchronized void remove(ClientConnectionContext connection) {
-        removeConnectionLocked(connection);
+    synchronized Session sessionForUsername(String username) {
+        Session session = sessionsByUsername.get(username);
+        if (session == null || !session.isActive()) {
+            return null;
+        }
+        return session;
     }
 
-    synchronized void clear() {
-        sessionsByConnection.clear();
-        sessionsByUsername.clear();
+    Session remove(ClientConnectionContext connection) {
+        Objects.requireNonNull(connection, "connection");
+
+        Session session;
+        synchronized (this) {
+            session = sessionsByConnection.get(connection);
+        }
+        if (session == null) {
+            return null;
+        }
+
+        session.deactivate();
+
+        synchronized (this) {
+            if (!sessionsByConnection.remove(connection, session)) {
+                return null;
+            }
+            sessionsByUsername.remove(session.username(), session);
+        }
+        return session;
+    }
+
+    void clear() {
+        List<Session> sessions;
+        synchronized (this) {
+            sessions = List.copyOf(sessionsByConnection.values());
+            sessionsByConnection.clear();
+            sessionsByUsername.clear();
+        }
+        for (Session session : sessions) {
+            session.deactivate();
+        }
     }
 
     synchronized int activeSessionCount() {
-        return sessionsByUsername.size();
+        return (int) sessionsByUsername.values().stream()
+                .filter(Session::isActive)
+                .count();
     }
 
-    private void removeConnectionLocked(ClientConnectionContext connection) {
+    synchronized List<String> usernames() {
+        return sessionsByUsername.values().stream()
+                .filter(Session::isActive)
+                .map(Session::username)
+                .sorted(Comparator.naturalOrder())
+                .toList();
+    }
+
+    private Session removeConnectionLocked(ClientConnectionContext connection) {
         Session session = sessionsByConnection.remove(connection);
         if (session != null) {
             sessionsByUsername.remove(session.username(), session);
         }
+        return session;
     }
 
     enum LoginStatus {

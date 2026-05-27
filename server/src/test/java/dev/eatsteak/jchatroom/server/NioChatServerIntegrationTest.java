@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
@@ -19,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 class NioChatServerIntegrationTest {
     @Test
@@ -156,7 +158,7 @@ class NioChatServerIntegrationTest {
                 writeRaw(socket, "LOGIN alpha\nLIST USERS\n");
 
                 assertEquals("OK LOGIN alpha", reader.readLine());
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                assertEquals("OK LIST USERS alpha", reader.readLine());
             }
         } finally {
             server.shutdown();
@@ -197,7 +199,7 @@ class NioChatServerIntegrationTest {
                 assertEquals("OK LOGIN alpha", reader.readLine());
                 writeLine(socket, "MSG lobby :" + "\uD55C".repeat(ProtocolValidator.MAX_MESSAGE_BODY_LENGTH));
 
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                assertEquals("ERR 404 :room not found", reader.readLine());
             }
         } finally {
             server.shutdown();
@@ -341,33 +343,271 @@ class NioChatServerIntegrationTest {
 
     @Test
     @Timeout(5)
-    void placeholderCommandsAfterLoginReturnNotImplementedWithoutClosing() throws Exception {
+    void roomCreateJoinLeaveDeletesEmptyRoom() throws Exception {
         NioChatServer server = new NioChatServer(testConfig());
         try {
             server.start();
 
-            try (Socket socket = connect(server.port())) {
-                BufferedReader reader = reader(socket);
+            try (Socket alpha = connect(server.port()); Socket beta = connect(server.port())) {
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
 
-                writeLine(socket, "LOGIN alpha");
-                assertEquals("OK LOGIN alpha", reader.readLine());
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
 
-                writeLine(socket, "ROOM CREATE lobby");
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                writeLine(alpha, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", alphaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", alphaReader.readLine());
 
-                writeLine(socket, "MSG lobby :hello");
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                writeLine(beta, "ROOM JOIN lobby");
+                assertEquals("OK ROOM JOIN lobby", betaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", alphaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", betaReader.readLine());
 
-                writeLine(socket, "WHISPER beta :private");
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                writeLine(beta, "ROOM LEAVE lobby");
+                assertEquals("OK ROOM LEAVE lobby", betaReader.readLine());
+                assertEquals("EVENT ROOM_LEAVE lobby beta", alphaReader.readLine());
 
-                writeLine(socket, "LIST USERS");
-                assertEquals("ERR 409 :not implemented yet", reader.readLine());
+                writeLine(alpha, "ROOM LEAVE lobby");
+                assertEquals("OK ROOM LEAVE lobby", alphaReader.readLine());
 
-                writeLine(socket, "QUIT");
-                assertEquals("OK QUIT", reader.readLine());
+                writeLine(alpha, "LIST ROOMS");
+                assertEquals("OK LIST ROOMS", alphaReader.readLine());
             }
         } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void listUsersAndRoomsAreSorted() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket beta = connect(server.port()); Socket alpha = connect(server.port())) {
+                BufferedReader betaReader = reader(beta);
+                BufferedReader alphaReader = reader(alpha);
+
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+
+                writeLine(beta, "LIST USERS");
+                assertEquals("OK LIST USERS alpha beta", betaReader.readLine());
+
+                writeLine(beta, "ROOM CREATE zed");
+                assertEquals("OK ROOM CREATE zed", betaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE zed beta", betaReader.readLine());
+                writeLine(beta, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", betaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby beta", betaReader.readLine());
+
+                writeLine(beta, "LIST ROOMS");
+                assertEquals("OK LIST ROOMS lobby zed", betaReader.readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void sameRoomBroadcastIsDeliveredOnlyToRoomMembers() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (
+                    Socket alpha = connect(server.port());
+                    Socket beta = connect(server.port());
+                    Socket gamma = connect(server.port())
+            ) {
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
+                BufferedReader gammaReader = reader(gamma);
+
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+                writeLine(gamma, "LOGIN gamma");
+                assertEquals("OK LOGIN gamma", gammaReader.readLine());
+
+                writeLine(alpha, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", alphaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", alphaReader.readLine());
+                writeLine(beta, "ROOM JOIN lobby");
+                assertEquals("OK ROOM JOIN lobby", betaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", alphaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", betaReader.readLine());
+
+                writeLine(alpha, "MSG lobby :hello room");
+                assertEquals("EVENT MSG lobby alpha :hello room", alphaReader.readLine());
+                assertEquals("EVENT MSG lobby alpha :hello room", betaReader.readLine());
+                assertNoLine(gamma, gammaReader);
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void differentRoomMessagesDoNotLeak() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket alpha = connect(server.port()); Socket beta = connect(server.port())) {
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
+
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+
+                writeLine(alpha, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", alphaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", alphaReader.readLine());
+                writeLine(beta, "ROOM CREATE side");
+                assertEquals("OK ROOM CREATE side", betaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE side beta", betaReader.readLine());
+
+                writeLine(alpha, "MSG lobby :only lobby");
+                assertEquals("EVENT MSG lobby alpha :only lobby", alphaReader.readLine());
+                assertNoLine(beta, betaReader);
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void whisperIsDeliveredOnlyToTargetWithSenderOk() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (
+                    Socket alpha = connect(server.port());
+                    Socket beta = connect(server.port());
+                    Socket gamma = connect(server.port())
+            ) {
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
+                BufferedReader gammaReader = reader(gamma);
+
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+                writeLine(gamma, "LOGIN gamma");
+                assertEquals("OK LOGIN gamma", gammaReader.readLine());
+
+                writeLine(alpha, "WHISPER beta :secret");
+                assertEquals("OK WHISPER beta", alphaReader.readLine());
+                assertEquals("EVENT WHISPER alpha :secret", betaReader.readLine());
+                assertNoLine(alpha, alphaReader);
+                assertNoLine(gamma, gammaReader);
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void missingRoomUserAndMembershipErrorsAreReported() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        try {
+            server.start();
+
+            try (Socket alpha = connect(server.port()); Socket beta = connect(server.port())) {
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
+
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+
+                writeLine(alpha, "ROOM JOIN missing");
+                assertEquals("ERR 404 :room not found", alphaReader.readLine());
+                writeLine(alpha, "ROOM LEAVE missing");
+                assertEquals("ERR 404 :room not found", alphaReader.readLine());
+                writeLine(alpha, "MSG missing :hello");
+                assertEquals("ERR 404 :room not found", alphaReader.readLine());
+                writeLine(alpha, "WHISPER missing_user :hello");
+                assertEquals("ERR 404 :user not found", alphaReader.readLine());
+
+                writeLine(alpha, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", alphaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", alphaReader.readLine());
+                writeLine(beta, "MSG lobby :not joined");
+                assertEquals("ERR 409 :not a room member", betaReader.readLine());
+            }
+        } finally {
+            server.shutdown();
+            assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void remoteCloseRemovesRoomMembershipAndUsername() throws Exception {
+        NioChatServer server = new NioChatServer(testConfig());
+        Socket beta = null;
+        try {
+            server.start();
+
+            try (Socket alpha = connect(server.port())) {
+                beta = connect(server.port());
+                BufferedReader alphaReader = reader(alpha);
+                BufferedReader betaReader = reader(beta);
+
+                writeLine(alpha, "LOGIN alpha");
+                assertEquals("OK LOGIN alpha", alphaReader.readLine());
+                writeLine(beta, "LOGIN beta");
+                assertEquals("OK LOGIN beta", betaReader.readLine());
+
+                writeLine(alpha, "ROOM CREATE lobby");
+                assertEquals("OK ROOM CREATE lobby", alphaReader.readLine());
+                assertEquals("EVENT ROOM_CREATE lobby alpha", alphaReader.readLine());
+                writeLine(beta, "ROOM JOIN lobby");
+                assertEquals("OK ROOM JOIN lobby", betaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", alphaReader.readLine());
+                assertEquals("EVENT ROOM_JOIN lobby beta", betaReader.readLine());
+
+                beta.close();
+                beta = null;
+                waitUntil(() -> server.activeSessionCount() == 1);
+
+                try (Socket nextBeta = connect(server.port())) {
+                    writeLine(nextBeta, "LOGIN beta");
+                    assertEquals("OK LOGIN beta", reader(nextBeta).readLine());
+                }
+
+                writeLine(alpha, "ROOM LEAVE lobby");
+                assertEquals("OK ROOM LEAVE lobby", alphaReader.readLine());
+                writeLine(alpha, "LIST ROOMS");
+                assertEquals("OK LIST ROOMS", alphaReader.readLine());
+            }
+        } finally {
+            if (beta != null) {
+                beta.close();
+            }
             server.shutdown();
             assertTrue(server.awaitTermination(Duration.ofSeconds(2)));
         }
@@ -491,6 +731,22 @@ class NioChatServerIntegrationTest {
     private static void writeRaw(Socket socket, String text) throws IOException {
         socket.getOutputStream().write(text.getBytes(StandardCharsets.UTF_8));
         socket.getOutputStream().flush();
+    }
+
+    private static void assertNoLine(Socket socket, BufferedReader reader) throws IOException {
+        int originalTimeout = socket.getSoTimeout();
+        socket.setSoTimeout(150);
+        try {
+            String line = reader.readLine();
+            if (line == null) {
+                fail("connection closed while waiting for no line");
+            }
+            fail("unexpected line: " + line);
+        } catch (SocketTimeoutException expected) {
+            // No line arrived during the short leak-detection window.
+        } finally {
+            socket.setSoTimeout(originalTimeout);
+        }
     }
 
     private static BufferedReader reader(Socket socket) throws IOException {
